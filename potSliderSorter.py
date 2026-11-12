@@ -56,7 +56,8 @@ statusPollSeconds = 0.35
 dashboardRefreshSeconds = 0.20
 bridgeTimeoutSeconds = 4.0
 unsHeartbeatSeconds = 2.0
-boxFullStopDelaySeconds = 3.0   
+boxFullStopDelaySeconds = 3.0
+boxResetButtonPin = 6  # MCU hardware button, active-low, wired between D6 and GND.
 
 # MQTT / Unified Namespace configuration.
 
@@ -1026,7 +1027,7 @@ def main():
                         "sliderUnits": data["sliderBoxCount"],
                         "finalItemTransitDelaySeconds": boxFullStopDelaySeconds,
                         "conveyorStopped": True,
-                        "operatorActionRequired": "install_new_box_then_press_N_or_ENTER",
+                        "operatorActionRequired": "install_new_box_then_press_N_or_ENTER_or_D6",
                     },
                 ),
             )
@@ -1051,7 +1052,7 @@ def main():
             data["boxStopConfirmed"] = False
             data["objectArmed"] = False
             data["absentFrames"] = 0
-            data["duplicateBlockedUntil"] = 0.0
+            data["duplicateBlockedUntil"] = time.monotonic() + duplicateSuppressionSeconds
             data["activeObjectLabel"] = "none"
             data["detection"] = "none"
             data["confidence"] = 0.0
@@ -1083,6 +1084,7 @@ def main():
                             "previousBoxNumber": previousBoxNumber,
                             "activeBoxNumber": nextBoxNumber,
                             "operatorAcknowledged": True,
+                            "acknowledgementSource": "terminal_key",
                         },
                     ),
                 )
@@ -1090,6 +1092,50 @@ def main():
         except Exception as error:
             bridgeOnline = False
             data["bridgeError"] = str(error)
+
+    def handleMcuButtonBoxReset(previousBoxNumber, previousCategory, status):
+        """Synchronize and publish a box reset initiated by the D6 MCU button."""
+        nextBoxNumber = status["boxNumber"]
+        if nextBoxNumber <= previousBoxNumber:
+            return False
+
+        data["potBoxCount"] = status["potBoxCount"]
+        data["sliderBoxCount"] = status["sliderBoxCount"]
+        data["boxNumber"] = nextBoxNumber
+        data["boxFull"] = status["boxFull"]
+        data["boxFullCategory"] = "none"
+        data["boxStopConfirmed"] = False
+        data["objectArmed"] = False
+        data["absentFrames"] = 0
+        data["duplicateBlockedUntil"] = time.monotonic() + duplicateSuppressionSeconds
+        data["activeObjectLabel"] = "none"
+        data["detection"] = "none"
+        data["confidence"] = 0.0
+        data["sortStatus"] = status
+        data["inferenceReady"] = status["inferenceReady"]
+        data["lastEvent"] = (
+            f"BOX {previousBoxNumber} CLOSED / BOX {nextBoxNumber} ACTIVE / D6"
+        )
+        data["runnerLine"] = "New box acknowledged by physical D6 button; conveyor resumed"
+
+        if unsPublisher:
+            unsPublisher.publishEvent(
+                unsBoxTopic,
+                buildUnsEvent(
+                    "newBoxPlaced",
+                    data,
+                    {
+                        "previousBoxNumber": previousBoxNumber,
+                        "activeBoxNumber": nextBoxNumber,
+                        "previousFullCategory": previousCategory,
+                        "operatorAcknowledged": True,
+                        "acknowledgementSource": "hardware_button_D6",
+                    },
+                ),
+            )
+
+        publishState(force=True)
+        return True
 
     try:
         while not runnerEnded:
@@ -1347,8 +1393,26 @@ def main():
                     newStatus = parseSortStatus(bridgeCall("getSortStatus"))
                     if newStatus is not None:
                         previousStatus = data["sortStatus"]
+                        previousBoxNumber = data["boxNumber"]
+                        previousBoxFull = data["boxFull"]
+                        previousBoxFullCategory = data["boxFullCategory"]
                         syncMcuStatus(newStatus)
-                        confirmBoxStop(newStatus)
+
+                        if (
+                            previousBoxFull
+                            and newStatus["boxNumber"] > previousBoxNumber
+                            and not newStatus["boxFull"]
+                            and newStatus["potBoxCount"] == 0
+                            and newStatus["sliderBoxCount"] == 0
+                        ):
+                            handleMcuButtonBoxReset(
+                                previousBoxNumber,
+                                previousBoxFullCategory,
+                                newStatus,
+                            )
+                        else:
+                            confirmBoxStop(newStatus)
+
                         if previousStatus != newStatus:
                             publishState(force=True)
                 except Exception as error:
@@ -1363,8 +1427,24 @@ def main():
                         newStatus = parseSortStatus(bridgeCall("getSortStatus"))
                         bridgeOnline = newStatus is not None
                         if bridgeOnline:
+                            previousBoxNumber = data["boxNumber"]
+                            previousBoxFull = data["boxFull"]
+                            previousBoxFullCategory = data["boxFullCategory"]
                             syncMcuStatus(newStatus)
-                            confirmBoxStop(newStatus)
+                            if (
+                                previousBoxFull
+                                and newStatus["boxNumber"] > previousBoxNumber
+                                and not newStatus["boxFull"]
+                                and newStatus["potBoxCount"] == 0
+                                and newStatus["sliderBoxCount"] == 0
+                            ):
+                                handleMcuButtonBoxReset(
+                                    previousBoxNumber,
+                                    previousBoxFullCategory,
+                                    newStatus,
+                                )
+                            else:
+                                confirmBoxStop(newStatus)
                             data["bridgeError"] = ""
                             if data["hasInference"] and not data["boxFull"] and not data["inferenceReady"]:
                                 started = bool(bridgeCall("startConveyor"))

@@ -1,33 +1,8 @@
 /*
   CONVEYOR LINE OBJECT DETECTION AND SORTER
   Edge Impulse + Arduino UNO Q
-  Roni Bandini // 11/2026
+  Roni Bandini - 11/2026
 
-  Servo positions:
-    middle/start -> 90 degrees
-    slider       -> 45 degrees
-    pot          -> 130 degrees
-
-  Servo returns to the middle position 5 seconds after an accepted detection
-  or new-box acknowledgement. The timer is non-blocking.
-
-  Box capacity is category-specific and configured in potSliderSorter.py:
-    - POT uses potBoxLimit.
-    - SLIDER uses sliderBoxLimit.
-    - The conveyor stops when either category reaches its own limit.
-    - The final item gets a 3000 ms transit window before the conveyor stops.
-
-  MCU stores independent current-box counters and receives both counters in
-  each registerObject() request. Python determines whether the category limit
-  has been reached and sends the full-box flag.
-
-  RPC methods:
-    waitForInference() -> bool
-    startConveyor() -> bool
-    registerObject("category,potCount,sliderCount,boxNumber,boxFull") -> bool
-    setDetection("pot" | "slider" | "none") -> bool
-    acknowledgeNewBox("nextBoxNumber") -> bool
-    getSortStatus() -> CSV string (11 fields)
 */
 
 #include <Servo.h>
@@ -46,6 +21,10 @@ const int SERVO_START_DEGREE = 90;
 
 // LOW = conveyor running; HIGH = conveyor stopped.
 const bool RELAY_ACTIVE_LOW = false;
+
+// Reset button
+const int BOX_RESET_BUTTON_PIN = 6;
+const unsigned long BUTTON_DEBOUNCE_MS = 40;
 
 const unsigned long RED_FLASH_INTERVAL_MS = 350;
 const unsigned long BOX_FULL_STOP_DELAY_MS = 3000;
@@ -98,6 +77,10 @@ unsigned long lastFlashAt = 0;
 unsigned long boxFullRegisteredAt = 0;
 unsigned long servoCommandAt = 0;
 bool servoReturnPending = false;
+
+int lastButtonReading = HIGH;
+int stableButtonState = HIGH;
+unsigned long buttonLastChangeAt = 0;
 
 // -----------------------------------------------------------------------------
 // RGB LED 3
@@ -331,16 +314,14 @@ bool registerObject(String registrationPayload) {
   return true;
 }
 
-bool acknowledgeNewBox(String nextBoxNumberText) {
-  nextBoxNumberText.trim();
-
-  // Accept a new box only after the 3-second transit delay and relay stop.
-  if (!boxFull || boxStopPending || sortState != SORT_BOX_FULL ||
-      !relayStopped || !nextBoxNumberText.length()) {
+bool resetCurrentBox(int nextBoxNumber, const char *acknowledgementSource) {
+  // Both the terminal N key and the physical D6 button use this same interlock.
+  // A reset is accepted only after the final-item transit delay has elapsed
+  // and the MCU confirms that the conveyor relay is stopped.
+  if (!boxFull || boxStopPending || sortState != SORT_BOX_FULL || !relayStopped) {
     return false;
   }
 
-  int nextBoxNumber = nextBoxNumberText.toInt();
   if (nextBoxNumber != boxNumber + 1) return false;
 
   boxNumber = nextBoxNumber;
@@ -356,11 +337,44 @@ bool acknowledgeNewBox(String nextBoxNumberText) {
   scheduleServoReturn();
   applyDetectionLed(DETECTION_NONE);
 
-  Serial.print("New box acknowledged. Active box: ");
+  Serial.print("New box acknowledged via ");
+  Serial.print(acknowledgementSource);
+  Serial.print(". Active box: ");
   Serial.println(boxNumber);
   Serial.println("POT and SLIDER category counters reset.");
   Serial.println(inferenceReady ? "Conveyor running." : "Waiting for first inference.");
   return true;
+}
+
+bool acknowledgeNewBox(String nextBoxNumberText) {
+  nextBoxNumberText.trim();
+  if (!nextBoxNumberText.length()) return false;
+
+  int nextBoxNumber = nextBoxNumberText.toInt();
+  return resetCurrentBox(nextBoxNumber, "terminal N key");
+}
+
+void updateBoxResetButton(unsigned long now) {
+  int reading = digitalRead(BOX_RESET_BUTTON_PIN);
+
+  if (reading != lastButtonReading) {
+    lastButtonReading = reading;
+    buttonLastChangeAt = now;
+  }
+
+  if (now - buttonLastChangeAt < BUTTON_DEBOUNCE_MS) return;
+  if (reading == stableButtonState) return;
+
+  stableButtonState = reading;
+
+  // Trigger once on the debounced HIGH -> LOW press edge.
+  if (stableButtonState == LOW) {
+    if (boxFull && !boxStopPending && sortState == SORT_BOX_FULL && relayStopped) {
+      resetCurrentBox(boxNumber + 1, "D6 push button");
+    } else {
+      Serial.println("D6 button pressed; ignored because no stopped full box is waiting.");
+    }
+  }
 }
 
 String getSortStatus() {
@@ -393,6 +407,12 @@ void setup() {
   writeRgb(false, true, false);
 
   pinMode(RELAY_PIN, OUTPUT);
+
+  pinMode(BOX_RESET_BUTTON_PIN, INPUT_PULLUP);
+  lastButtonReading = digitalRead(BOX_RESET_BUTTON_PIN);
+  stableButtonState = lastButtonReading;
+  buttonLastChangeAt = millis();
+
   inferenceReady = false;
   boxFull = false;
   boxStopPending = false;
@@ -413,6 +433,8 @@ void setup() {
   Serial.println(servoReady ? "YES" : "NO");
   Serial.println("Servo targets: slider=45, pot=130, middle=90");
   Serial.println("POT and SLIDER box limits are configured independently in Python.");
+  Serial.println("Box reset button: D6 to GND (INPUT_PULLUP).");
+  Serial.println("New boxes can be acknowledged with terminal N/ENTER or the D6 button.");
   Serial.println("Conveyor default: STOPPED - waiting for first inference");
 
   if (!Bridge.begin()) {
@@ -441,6 +463,7 @@ void loop() {
   unsigned long now = millis();
 
   updateServoReturn(now);
+  updateBoxResetButton(now);
 
   if (boxStopPending && now - boxFullRegisteredAt >= BOX_FULL_STOP_DELAY_MS) {
     boxStopPending = false;
